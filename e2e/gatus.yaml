@@ -1,0 +1,14 @@
+# Hand-written Gatus config: stays untouched, pangolin.yaml is merged next to it.
+alerting:
+  custom:
+    url: "http://mock-pangolin:3003/alert"
+    method: "POST"
+    body: "[ENDPOINT_NAME] [ALERT_DESCRIPTION]"
+
+endpoints:
+  - name: Manually configured service
+    group: Other
+    url: "tcp://mock-pangolin:3003"
+    interval: 10s
+    conditions:
+      - "[CONNECTED] == true"

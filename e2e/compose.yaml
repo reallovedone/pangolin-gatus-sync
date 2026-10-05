@@ -1,0 +1,49 @@
+# End-to-end test: fake Pangolin + pangolin-gatus-sync + real Gatus.
+#   docker compose -f e2e/compose.yaml up -d --build && python e2e/check.py
+#   docker compose -f e2e/compose.yaml down -v
+name: pangolin-gatus-sync-e2e
+
+services:
+  mock-pangolin:
+    image: python:3.13-alpine
+    command: ["python", "/mock/mock_pangolin.py", "3003"]
+    volumes:
+      - ../tests/mock_pangolin.py:/mock/mock_pangolin.py:ro
+
+  pangolin-gatus-sync:
+    build: ..
+    environment:
+      PANGOLIN_API_URL: http://mock-pangolin:3003/v1
+      PANGOLIN_ORG_ID: demo-org
+      PANGOLIN_API_KEY: test-key
+      GATUS_ALERT_TYPES: custom
+      CHECK_INTERVAL: 10s
+      SYNC_INTERVAL: "10"
+      RESOURCE_EXCLUDE: ${E2E_EXCLUDE:-}
+    volumes:
+      - generated:/config
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - mock-pangolin
+
+  gatus:
+    image: twinproduction/gatus:latest
+    environment:
+      GATUS_CONFIG_PATH: /config
+      PANGOLIN_API_KEY: test-key
+    volumes:
+      - ./gatus.yaml:/config/config.yaml:ro
+      - generated:/config/pangolin
+    ports:
+      - "18080:8080"
+    depends_on:
+      - pangolin-gatus-sync
+
+volumes:
+  generated:

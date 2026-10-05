@@ -1,0 +1,22 @@
+# pangolin-gatus-sync: runs next to Gatus and writes Pangolin endpoints into the Gatus config folder.
+# Configure it in .env (see .env.example), then: docker compose up -d --build
+name: pangolin-gatus-sync
+
+services:
+  pangolin-gatus-sync:
+    image: ghcr.io/reallovedone/pangolin-gatus-sync:latest
+    build: .
+    container_name: pangolin-gatus-sync
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # The folder Gatus loads its configuration from (GATUS_CONFIG_PATH=/config in Gatus).
+      - ${GATUS_CONFIG_DIR:?set GATUS_CONFIG_DIR in .env}:/config
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m

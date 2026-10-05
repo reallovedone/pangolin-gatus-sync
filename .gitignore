@@ -1,0 +1,7 @@
+.env
+*.tmp
+__pycache__/
+*.pyc
+e2e/generated/
+CLAUDE.md
+.venv/
