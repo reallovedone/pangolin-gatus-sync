@@ -1,11 +1,17 @@
-# pangolin-gatus-sync
+<p align="center">
+  <img src="assets/logo.svg" alt="pangolin-gatus-sync logo: a pangolin curled into a ball of scales, one scale lit green" width="140">
+</p>
 
-**Show your Pangolin resources on your Gatus status page, with automatic discovery and alerts.**
+<h1 align="center">pangolin-gatus-sync</h1>
 
-[![CI](https://github.com/reallovedone/pangolin-gatus-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/reallovedone/pangolin-gatus-sync/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Python](https://img.shields.io/badge/python-3.9%2B-blue)
-![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+<p align="center"><b>Show your Pangolin resources on your Gatus status page, with automatic discovery and alerts.</b></p>
+
+<p align="center">
+  <a href="https://github.com/reallovedone/pangolin-gatus-sync/actions/workflows/ci.yml"><img src="https://github.com/reallovedone/pangolin-gatus-sync/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/dependencies-none-brightgreen" alt="No dependencies">
+</p>
 
 `pangolin-gatus-sync` is a small **Gatus sidecar** for self-hosted
 [Pangolin](https://github.com/fosrl/pangolin) (the tunneled reverse proxy built on WireGuard and Traefik).
