@@ -8,12 +8,12 @@ from urllib.request import urlopen
 
 GATUS = "http://localhost:18080/api/v1/endpoints/statuses"
 EXPECTED = {
-    # name: expected success of the last result
-    "Pangolin API": True,
-    "Nextcloud": True,
-    "Grafana": False,          # health == unhealthy
-    "Starting up": True,       # health == unknown with an active check (FAIL_ON_UNKNOWN=false)
-    "Cost $avings": True,      # $ escaped as $$ in the file
+    # name: (group, expected success of the last result)
+    "Pangolin API": ("Pangolin", True),
+    "Nextcloud": ("Produzione", True),    # label env:prod
+    "Grafana": ("Squadre", False),        # health == unhealthy; labels env:prod + team:infra, team:* is listed first
+    "Starting up": ("Staging", True),     # health == unknown with an active check (FAIL_ON_UNKNOWN=false)
+    "Cost $avings": ("Pangolin", True),   # no label: default group; $ escaped as $$ in the file
 }
 ABSENT = {"No health check", "Disabled"}
 
@@ -35,10 +35,10 @@ def main():
             continue
         if all(name in current for name in EXPECTED) and "Manually configured service" in current:
             failures = []
-            for name, expected in EXPECTED.items():
+            for name, (group, expected) in EXPECTED.items():
                 result = current[name]["results"][-1]
-                if current[name].get("group") != "Pangolin":
-                    failures.append(f"{name}: group {current[name].get('group')!r}")
+                if current[name].get("group") != group:
+                    failures.append(f"{name}: group {current[name].get('group')!r}, expected {group!r}")
                 if result["success"] != expected:
                     failures.append(f"{name}: success={result['success']} expected {expected}: "
                                     f"{result.get('conditionResults')} {result.get('errors')}")

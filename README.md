@@ -39,6 +39,8 @@ not available.
 - **Tiny and transparent:** one Python file, standard library only, a 64 MB container with a read-only
   filesystem and no capabilities.
 - **Filters:** include or exclude resources by name or domain with glob patterns.
+- **Groups by label:** split the status page into several groups (Production, Staging...) from the
+  labels you already set in Pangolin. One group by default, more only if you ask for them.
 
 ## How it works
 
@@ -63,7 +65,9 @@ flowchart LR
 4. It adds one `Pangolin API` endpoint, so you can tell "the API is unreachable" apart from
    "a service is down".
 5. Gatus loads every YAML file in its config folder and reloads it when the file changes. The sidecar
-   writes only when something actually changed.
+   writes only when something actually changed. After the very first write it touches the file once,
+   10 seconds later: Gatus compares file times in whole seconds and could miss a file that was created
+   while it was still starting.
 
 ## Quick start
 
@@ -126,7 +130,8 @@ The **Pangolin** group then appears on your Gatus dashboard.
 | `GATUS_ALERT_TYPES` | *(none)* | Comma-separated alert providers, e.g. `telegram,email`. Each must be configured under `alerting:` |
 | `ALERT_FAILURE_THRESHOLD` | `2` | Consecutive failures before alerting |
 | `ALERT_SUCCESS_THRESHOLD` | `1` | Consecutive successes before resolving |
-| `GATUS_GROUP` | `Pangolin` | Group name on the status page |
+| `GATUS_GROUP` | `Pangolin` | Default group name on the status page, also used for resources that match no label rule |
+| `GATUS_LABEL_GROUPS` | *(none)* | Put resources in other groups by Pangolin label: `label=Group,label2=Group2`. See [Groups by label](#groups-by-label) |
 | `SYNC_INTERVAL` | `300` | Seconds between two syncs |
 | `CHECK_INTERVAL` | `60s` | Gatus polling interval for each resource |
 | `FAIL_ON_UNKNOWN` | `false` | Also fail when Pangolin reports `unknown`, e.g. a check that never completed |
@@ -139,7 +144,75 @@ The **Pangolin** group then appears on your Gatus dashboard.
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 Command line: `--once` (single sync), `--dry-run` (print the YAML, write nothing),
-`--healthcheck` (used by the container health check), `--version`.
+`--show-labels` (list the Pangolin labels in use, see below), `--healthcheck` (used by the container
+health check), `--version`.
+
+### Groups by label
+
+By default every resource goes to one group, named by `GATUS_GROUP` (`Pangolin`). If you label your
+resources in Pangolin, you can split them into several groups on the Gatus page with `GATUS_LABEL_GROUPS`:
+
+```
+GATUS_LABEL_GROUPS=prod=Production,critical=Production,staging=Staging
+```
+
+Each entry reads **"resources labelled `label` go to group `Group`"**. Entries are separated by commas.
+
+| Resource labels | Group |
+|---|---|
+| `prod` | Production |
+| `staging` | Staging |
+| `critical` | Production |
+| `docs`, `wiki` (no rule matches) | `Pangolin`, the default group |
+| *(no label at all)* | `Pangolin`, the default group |
+
+**A resource always ends up in exactly one group: the first matching rule wins.** If a resource carries
+several labels that match different rules, the rule that is written **first in `GATUS_LABEL_GROUPS`** decides,
+not the order of the labels on the resource. A resource is never duplicated in two groups, so it is
+checked once and alerts once. Put the most specific rules first:
+
+```
+GATUS_LABEL_GROUPS=critical=Critical,env:*=Environments
+```
+
+A resource labelled `env:prod` and `critical` goes to **Critical**, because that rule comes first.
+Swap the two entries and it goes to **Environments**.
+
+Matching rules:
+
+- Labels are compared by name, **ignoring case**, and must match the **whole** label: `prod` does not match
+  `production` or `myprod`.
+- `*` and `?` work as wildcards. `env:*` matches `env:prod` and `env:staging`, and puts both in the *same*
+  group. To get one group per environment, write one entry for each: `env:prod=Production,env:staging=Staging`.
+- Group names may contain spaces. They cannot contain a comma, and a label cannot contain `=`.
+- Group names that differ only by case (`Prod` and `prod`) are merged into the first spelling, because Gatus
+  ignores case in its endpoint keys.
+- The `Pangolin API` endpoint always stays in the default group.
+- Resources are still filtered by `RESOURCE_INCLUDE`, `RESOURCE_EXCLUDE` and the health check requirement
+  before they are grouped.
+
+Not sure which labels you have? Ask the sidecar. It also shows where your current rules would put the
+monitored resources:
+
+```bash
+docker compose run --rm pangolin-gatus-sync --show-labels
+```
+
+```
+Labels found on 41 resources:
+    12  env:prod
+     7  env:staging
+     5  team:infra
+    20  (no label)
+
+With the current GATUS_LABEL_GROUPS, monitored resources go to:
+     9  Production
+     4  Staging
+     5  Pangolin
+```
+
+Labels need a Pangolin version that reports them in the resource list. If yours does not, the sidecar logs
+one warning and keeps everything in the default group.
 
 ### Example generated endpoint
 
@@ -187,6 +260,15 @@ Resource names are visible, so use `RESOURCE_EXCLUDE` for anything you do not wa
 
 **Does it need the Pangolin Cloud or Enterprise edition?**
 No. It only uses the resource endpoints of the Integration API, which the community edition also has.
+
+**Why does a resource appear in only one group?**
+Each resource is checked once, so it is assigned to one group, the first rule that matches. See
+[Groups by label](#groups-by-label).
+
+**Gatus shows no Pangolin endpoints right after the first start.**
+They should appear within about a minute. The sidecar touches the generated file once, shortly after
+creating it, so that Gatus does not miss it. If they never appear, check that Gatus reads the same folder
+as the sidecar (`GATUS_CONFIG_PATH` is a folder, not a single file).
 
 ## Development
 
