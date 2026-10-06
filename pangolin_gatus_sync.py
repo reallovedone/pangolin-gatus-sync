@@ -27,12 +27,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 log = logging.getLogger("pangolin-gatus-sync")
 
 HEALTHY, UNHEALTHY, UNKNOWN = "healthy", "unhealthy", "unknown"
 PAGE_SIZE = 100
+# Gatus compares file times in whole seconds against the moment it loaded its config, so a file written
+# while Gatus is starting can be missed for good. Touching it once, a few seconds later, fixes that.
+NUDGE_DELAY = 10
 MAX_PAGES = 1000
 
 
@@ -79,6 +82,20 @@ def _env_list(env: dict, name: str) -> list[str]:
     return [item.strip() for item in env.get(name, "").split(",") if item.strip()]
 
 
+def _parse_label_groups(raw: str, default_group: str) -> list[tuple[str, str]]:
+    """Parse GATUS_LABEL_GROUPS ("label=Group,other-*=Group 2") into ordered (pattern, group) rules."""
+    canonical = {default_group.lower(): default_group}  # Gatus keys ignore case: keep one spelling
+    rules = []
+    for entry in (item.strip() for item in raw.split(",")):
+        if not entry:
+            continue
+        pattern, separator, group = (part.strip() for part in entry.partition("="))
+        if not separator or not pattern or not group:
+            raise ConfigError(f"GATUS_LABEL_GROUPS entries must look like label=Group, got {entry!r}")
+        rules.append((pattern, canonical.setdefault(group.lower(), group)))
+    return rules
+
+
 @dataclass
 class Config:
     api_url: str
@@ -87,6 +104,7 @@ class Config:
     output_file: Path = Path("/config/pangolin.yaml")
     state_file: Path = Path("/tmp/pangolin-gatus-sync.ok")
     group: str = "Pangolin"
+    label_groups: list[tuple[str, str]] = field(default_factory=list)
     sync_interval: int = 300
     check_interval: str = "60s"
     alert_types: list[str] = field(default_factory=list)
@@ -99,6 +117,8 @@ class Config:
     api_endpoint: bool = True
     api_key_env: str = "PANGOLIN_API_KEY"
     timeout: int = 15
+    warned: set = field(default_factory=set, repr=False, compare=False)  # one-time warnings
+    touch_pending: bool = field(default=False, repr=False, compare=False)  # file changed, see NUDGE_DELAY
 
     @classmethod
     def from_env(cls, env: dict | None = None, require_key: bool = True) -> "Config":
@@ -113,13 +133,15 @@ class Config:
         if not re.fullmatch(r"\d+(ms|s|m|h)", check_interval):
             raise ConfigError(f"CHECK_INTERVAL must look like 30s, 1m or 1h, got {check_interval!r}")
 
+        group = env.get("GATUS_GROUP", "").strip() or "Pangolin"
         return cls(
             api_url=env["PANGOLIN_API_URL"].strip().rstrip("/"),
             org_id=env["PANGOLIN_ORG_ID"].strip(),
             api_key=env.get("PANGOLIN_API_KEY", "").strip(),
             output_file=Path(env.get("OUTPUT_FILE", "").strip() or "/config/pangolin.yaml"),
             state_file=Path(env.get("STATE_FILE", "").strip() or "/tmp/pangolin-gatus-sync.ok"),
-            group=env.get("GATUS_GROUP", "").strip() or "Pangolin",
+            group=group,
+            label_groups=_parse_label_groups(env.get("GATUS_LABEL_GROUPS", ""), group),
             sync_interval=_env_int(env, "SYNC_INTERVAL", 300, minimum=10),
             check_interval=check_interval,
             alert_types=_env_list(env, "GATUS_ALERT_TYPES"),
@@ -256,6 +278,39 @@ def select_resources(resources: list[dict], config: Config, client: PangolinClie
     return sorted(selected, key=lambda r: (str(r.get("name") or "").lower(), str(r.get("resourceId"))))
 
 
+def label_names(resource: dict) -> list[str]:
+    """Names of the labels attached to a resource (empty when Pangolin does not report any)."""
+    labels = resource.get("labels")
+    if not isinstance(labels, list):
+        return []
+    return [str(label["name"]) for label in labels if isinstance(label, dict) and label.get("name")]
+
+
+def group_for(resource: dict, config: Config) -> str:
+    """Gatus group of a resource: the first GATUS_LABEL_GROUPS rule matching one of its labels wins."""
+    names = [name.lower() for name in label_names(resource)]
+    for pattern, group in config.label_groups:
+        if any(fnmatch.fnmatchcase(name, pattern.lower()) for name in names):
+            return group
+    return config.group
+
+
+def group_counts(resources: list[dict], config: Config) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for resource in resources:
+        group = group_for(resource, config)
+        counts[group] = counts.get(group, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: item[0].lower()))
+
+
+def warn_if_labels_missing(resources: list[dict], config: Config) -> None:
+    """Label groups are configured but Pangolin never sends labels: tell the user once."""
+    if config.label_groups and "labels" not in config.warned and not any("labels" in r for r in resources):
+        config.warned.add("labels")
+        log.warning("GATUS_LABEL_GROUPS is set but Pangolin does not report labels "
+                    "(older version?): every resource goes to the %r group", config.group)
+
+
 # --------------------------------------------------------------------------- Gatus config
 
 
@@ -269,22 +324,27 @@ def gatus_key(group: str, name: str) -> str:
     return re.sub(r"[ /_,.#+&]", "-", f"{group}_{name}".lower())
 
 
-def endpoint_names(resources: list[dict], group: str) -> dict:
-    """Readable endpoint names, disambiguated when two resources would collide in Gatus."""
+def endpoint_names(resources: list[dict], groups: dict) -> dict:
+    """Readable endpoint names, disambiguated when two resources of a group would collide in Gatus.
+
+    groups maps resourceId to its Gatus group: the same name in two different groups is not a collision.
+    """
     base = {r["resourceId"]: str(r.get("name") or r.get("fullDomain") or f"resource {r['resourceId']}")
             for r in resources}
     counts: dict = {}
-    for name in base.values():
-        key = gatus_key(group, name)
+    for rid, name in base.items():
+        key = gatus_key(groups[rid], name)
         counts[key] = counts.get(key, 0) + 1
-    names = {}
+    names, used = {}, set()
     for resource in resources:
         rid = resource["resourceId"]
+        group = groups[rid]
         name = base[rid]
         if counts[gatus_key(group, name)] > 1:
             name = f"{name} ({resource.get('fullDomain') or rid})"
-            if counts.get(gatus_key(group, name)) or name in names.values():
+            if counts.get(gatus_key(group, name)) or gatus_key(group, name) in used:
                 name = f"{base[rid]} (#{rid})"
+        used.add(gatus_key(group, name))
         names[rid] = name
     return names
 
@@ -298,10 +358,10 @@ def build_gatus_config(resources: list[dict], config: Config, client: PangolinCl
         # any() fails when the field is missing, unlike != which would pass on a malformed body.
         health_condition = f"[BODY].data.health == any({HEALTHY}, {UNKNOWN})"
 
-    def common(name: str, url: str, conditions: list[str], description: str) -> dict:
+    def common(name: str, group: str, url: str, conditions: list[str], description: str) -> dict:
         endpoint = {
             "name": gatus_escape(name),
-            "group": gatus_escape(config.group),
+            "group": gatus_escape(group),
             "url": url,
             "interval": config.check_interval,
             "headers": dict(auth),
@@ -327,16 +387,20 @@ def build_gatus_config(resources: list[dict], config: Config, client: PangolinCl
     if config.api_endpoint:
         endpoints.append(common(
             "Pangolin API",
+            config.group,
             f"{base_url}{gatus_escape(client.list_path)}?page=1&pageSize=1",
             ["[STATUS] == 200"],
             "Pangolin Integration API unreachable: every Pangolin check depends on it",
         ))
-    names = endpoint_names(resources, config.group)
-    for resource in resources:
+    groups = {r["resourceId"]: group_for(r, config) for r in resources}
+    names = endpoint_names(resources, groups)
+    # Stable sort: resources stay ordered by name inside each group.
+    for resource in sorted(resources, key=lambda r: groups[r["resourceId"]].lower()):
         rid = resource["resourceId"]
         domain = str(resource.get("fullDomain") or "")
         endpoints.append(common(
             names[rid],
+            groups[rid],
             f"{base_url}{client.detail_path.format(id=quote(str(rid), safe=''))}",
             ["[STATUS] == 200", health_condition],
             f"Pangolin resource {domain or names[rid]} is unhealthy",
@@ -416,20 +480,64 @@ def sync_once(config: Config, dry_run: bool = False) -> bool:
         log.error("sync failed, keeping the current %s: %s", config.output_file, exc)
         return False
 
+    warn_if_labels_missing(resources, config)
     content = render_yaml(build_gatus_config(selected, config, client), config)
     summary = f"{len(resources)} resources, {len(selected)} with an active health check"
+    if config.label_groups:
+        summary += " (" + ", ".join(f"{g}: {n}" for g, n in group_counts(selected, config).items()) + ")"
     if dry_run:
         sys.stdout.write(content)
         log.info("dry run: %s", summary)
         return True
     try:
         changed = write_if_changed(config.output_file, content)
+        config.touch_pending = config.touch_pending or changed
         config.state_file.write_text(str(time.time()), encoding="utf-8")
     except OSError as exc:
         log.error("cannot write %s: %s", config.output_file, exc)
         return False
     log.info("%s, %s %s", summary, "updated" if changed else "unchanged", config.output_file)
     return True
+
+
+def show_labels(config: Config) -> bool:
+    """Print the labels Pangolin reports and, when GATUS_LABEL_GROUPS is set, where resources would go."""
+    client = PangolinClient(config)
+    try:
+        resources = client.list_resources()
+        selected = select_resources(resources, config, client) if config.label_groups else []
+    except ApiError as exc:
+        log.error("cannot read resources: %s", exc)
+        return False
+
+    counts: dict[str, int] = {}
+    for resource in resources:
+        for name in set(label_names(resource)):
+            counts[name] = counts.get(name, 0) + 1
+    unlabeled = sum(1 for r in resources if not label_names(r))
+    out = sys.stdout
+    if not counts and not any("labels" in r for r in resources):
+        out.write("Pangolin does not report labels for these resources (older version?).\n")
+        return True
+    out.write(f"Labels found on {len(resources)} resources:\n")
+    for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0].lower())):
+        out.write(f"  {count:4d}  {name}\n")
+    out.write(f"  {unlabeled:4d}  (no label)\n")
+    if config.label_groups:
+        out.write("\nWith the current GATUS_LABEL_GROUPS, monitored resources go to:\n")
+        for group, count in group_counts(selected, config).items():
+            out.write(f"  {count:4d}  {group}\n")
+    return True
+
+
+def touch_output(config: Config) -> None:
+    """Bump the modification time of the generated file so Gatus notices it (see NUDGE_DELAY)."""
+    try:
+        os.utime(config.output_file, None)
+    except OSError as exc:
+        log.warning("cannot touch %s: %s", config.output_file, exc)
+        return
+    log.debug("touched %s", config.output_file)
 
 
 def healthcheck(config: Config) -> bool:
@@ -452,9 +560,16 @@ def run_forever(config: Config) -> None:
     signal.signal(signal.SIGINT, _stop)
     log.info("pangolin-gatus-sync %s: syncing %s every %ss into %s",
              __version__, config.org_id, config.sync_interval, config.output_file)
+    first = True
     while not stop.is_set():
+        started = time.monotonic()
         sync_once(config)
-        stop.wait(config.sync_interval)
+        if first and config.touch_pending:
+            if not stop.wait(NUDGE_DELAY):
+                touch_output(config)
+            config.touch_pending = False
+        first = False
+        stop.wait(max(0.0, config.sync_interval - (time.monotonic() - started)))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -463,6 +578,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="run a single sync and exit")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the generated Gatus config to stdout without writing it")
+    parser.add_argument("--show-labels", action="store_true",
+                        help="list the Pangolin labels in use and the groups GATUS_LABEL_GROUPS would create")
     parser.add_argument("--healthcheck", action="store_true",
                         help="exit 0 if the last successful sync is recent (container health)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -481,6 +598,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.healthcheck:
         return 0 if healthcheck(config) else 1
+    if args.show_labels:
+        return 0 if show_labels(config) else 1
     if args.once or args.dry_run:
         return 0 if sync_once(config, dry_run=args.dry_run) else 1
     run_forever(config)

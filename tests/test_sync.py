@@ -1,5 +1,8 @@
+import contextlib
+import io
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -175,6 +178,171 @@ class TestConfig(unittest.TestCase):
             with self.assertRaises(pgs.ConfigError, msg=name):
                 pgs.Config.from_env({**base, name: value})
         self.assertEqual(pgs.Config.from_env(base).api_url, "http://x/v1")
+
+
+BASE_ENV = {"PANGOLIN_API_URL": "http://x/v1", "PANGOLIN_ORG_ID": "o", "PANGOLIN_API_KEY": "k"}
+RULES = "team:*=Squadre,env:prod=Produzione,env:staging=Staging"
+
+
+class TestLabelGroupsConfig(unittest.TestCase):
+    def rules(self, raw, **extra):
+        return pgs.Config.from_env({**BASE_ENV, "GATUS_LABEL_GROUPS": raw, **extra}).label_groups
+
+    def test_not_set_means_no_rules(self):
+        self.assertEqual(pgs.Config.from_env(BASE_ENV).label_groups, [])
+        self.assertEqual(self.rules(" , ,"), [])
+
+    def test_entries_keep_their_order(self):
+        self.assertEqual(self.rules("prod = Produzione, staging=Staging ,env:*=Ambienti"),
+                         [("prod", "Produzione"), ("staging", "Staging"), ("env:*", "Ambienti")])
+
+    def test_group_spelling_is_unified_because_gatus_keys_ignore_case(self):
+        rules = self.rules("a=Prod,b=prod,c=PANGOLIN", GATUS_GROUP="Pangolin")
+        self.assertEqual([group for _, group in rules], ["Prod", "Prod", "Pangolin"])
+
+    def test_malformed_entries_are_rejected(self):
+        for raw in ("prod", "=Group", "prod=", " = ", "ok=Fine,broken"):
+            with self.assertRaises(pgs.ConfigError, msg=raw):
+                self.rules(raw)
+
+
+class TestGroupFor(unittest.TestCase):
+    config = pgs.Config(api_url="http://x/v1", org_id="o", api_key="k",
+                        label_groups=[("critical", "Critici"), ("env:*", "Ambienti"), ("PROD", "Produzione")])
+
+    @staticmethod
+    def labelled(*names):
+        return {"labels": [{"name": name} for name in names]}
+
+    def test_first_rule_wins_not_first_label(self):
+        # The resource carries env:prod first, but the "critical" rule is listed before "env:*".
+        self.assertEqual(pgs.group_for(self.labelled("env:prod", "critical"), self.config), "Critici")
+        self.assertEqual(pgs.group_for(self.labelled("critical", "env:prod"), self.config), "Critici")
+
+    def test_wildcard_and_case_insensitive_matching(self):
+        self.assertEqual(pgs.group_for(self.labelled("env:staging"), self.config), "Ambienti")
+        self.assertEqual(pgs.group_for(self.labelled("ENV:Dev"), self.config), "Ambienti")
+        self.assertEqual(pgs.group_for(self.labelled("prod"), self.config), "Produzione")
+
+    def test_pattern_must_match_the_whole_label(self):
+        self.assertEqual(pgs.group_for(self.labelled("myenv:prod"), self.config), "Pangolin")
+        self.assertEqual(pgs.group_for(self.labelled("production"), self.config), "Pangolin")
+
+    def test_unlabelled_or_malformed_resources_use_the_default_group(self):
+        for resource_ in ({}, {"labels": None}, {"labels": []}, {"labels": "prod"},
+                          {"labels": ["prod", {"labelId": 1}, {"name": ""}]}):
+            self.assertEqual(pgs.group_for(resource_, self.config), "Pangolin", msg=resource_)
+
+    def test_no_rules_always_default_group(self):
+        config = pgs.Config(api_url="http://x/v1", org_id="o", api_key="k", group="Mine")
+        self.assertEqual(pgs.group_for(self.labelled("env:prod"), config), "Mine")
+
+
+class TestLabelGroupsSync(SyncTestCase):
+    def endpoints(self, **env):
+        text, endpoints = self.generated(**env)
+        if endpoints is None:
+            self.skipTest("PyYAML not installed")
+        return text, {e["name"]: e["group"] for e in endpoints}
+
+    def test_endpoints_are_assigned_to_groups(self):
+        _, groups = self.endpoints(GATUS_LABEL_GROUPS=RULES)
+        self.assertEqual(groups, {
+            "Pangolin API": "Pangolin",        # the API check stays in the default group
+            "Nextcloud": "Produzione",
+            "Grafana": "Squadre",              # env:prod and team:infra: the team:* rule is listed first
+            "Starting up": "Staging",
+            "Cost $$avings": "Pangolin",       # no label: default group
+        })
+
+    def test_default_group_name_is_configurable(self):
+        _, groups = self.endpoints(GATUS_LABEL_GROUPS=RULES, GATUS_GROUP="Altro")
+        self.assertEqual(groups["Cost $$avings"], "Altro")
+        self.assertEqual(groups["Pangolin API"], "Altro")
+
+    def test_group_names_are_escaped_for_gatus(self):
+        text, _ = self.generated(GATUS_LABEL_GROUPS="env:prod=Cash $ Flow")
+        self.assertIn('group: "Cash $$ Flow"', text)
+
+    def test_output_is_identical_to_before_when_no_rules_are_set(self):
+        # Pangolin reports labels, but without GATUS_LABEL_GROUPS they must not change anything.
+        with_labels, _ = self.generated()
+        self.mock.no_labels = True
+        other = Path(self.tmp.name) / "without-labels.yaml"
+        self.assertTrue(pgs.sync_once(self.config(OUTPUT_FILE=str(other))))
+        self.assertEqual(other.read_text(encoding="utf-8"), with_labels)
+        self.assertEqual(with_labels.count('group: "Pangolin"'), 5)
+
+    def test_pangolin_without_labels_falls_back_and_warns_once(self):
+        self.mock.no_labels = True
+        cfg = self.config(GATUS_LABEL_GROUPS=RULES)
+        self.assertTrue(pgs.sync_once(cfg))
+        self.assertEqual(cfg.warned, {"labels"})
+        first = self.output.read_text(encoding="utf-8")
+        self.assertEqual(first.count('group: "Pangolin"'), 5)
+        self.assertTrue(pgs.sync_once(cfg))
+        self.assertEqual(cfg.warned, {"labels"})
+
+    def test_show_labels_lists_labels_and_resulting_groups(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertTrue(pgs.show_labels(self.config(GATUS_LABEL_GROUPS=RULES)))
+        out = buffer.getvalue()
+        self.assertRegex(out, r"\n\s+2\s+env:prod\n")
+        self.assertRegex(out, r"\n\s+1\s+team:infra\n")
+        self.assertRegex(out, r"\n\s+3\s+\(no label\)\n")
+        for group in ("Squadre", "Produzione", "Staging", "Pangolin"):
+            self.assertRegex(out, rf"\n\s+1\s+{group}\n")
+
+    def test_show_labels_without_label_support(self):
+        self.mock.no_labels = True
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertTrue(pgs.show_labels(self.config()))
+        self.assertIn("does not report labels", buffer.getvalue())
+
+
+class TestSameNameAcrossGroups(SyncTestCase):
+    resources = [
+        resource(1, "web", "a.example.com", labels=["prod"]),
+        resource(2, "web", "b.example.com", labels=["staging"]),
+        resource(3, "api", "c.example.com", labels=["prod"]),
+        resource(4, "api", "d.example.com", labels=["prod"]),
+    ]
+
+    def test_only_collisions_inside_a_group_are_renamed(self):
+        _, endpoints = self.generated(GATUS_LABEL_GROUPS="prod=Produzione,staging=Staging")
+        if endpoints is None:
+            self.skipTest("PyYAML not installed")
+        pairs = {(e["group"], e["name"]) for e in endpoints}
+        self.assertIn(("Produzione", "web"), pairs)
+        self.assertIn(("Staging", "web"), pairs)
+        self.assertIn(("Produzione", "api (c.example.com)"), pairs)
+        self.assertIn(("Produzione", "api (d.example.com)"), pairs)
+        self.assertEqual(len(pairs), len(endpoints))
+
+
+class TestTouchForGatus(SyncTestCase):
+    def test_touch_is_requested_only_when_the_file_changed(self):
+        cfg = self.config()
+        self.assertTrue(pgs.sync_once(cfg))
+        self.assertTrue(cfg.touch_pending)              # file created: Gatus may have missed it
+        cfg.touch_pending = False
+        self.assertTrue(pgs.sync_once(cfg))
+        self.assertFalse(cfg.touch_pending)             # unchanged: nothing to nudge
+
+    def test_touch_output_bumps_the_modification_time(self):
+        cfg = self.config()
+        self.assertTrue(pgs.sync_once(cfg))
+        old = time.time() - 3600
+        os.utime(self.output, (old, old))
+        before = self.output.read_text(encoding="utf-8")
+        pgs.touch_output(cfg)
+        self.assertGreater(self.output.stat().st_mtime, old + 3000)
+        self.assertEqual(self.output.read_text(encoding="utf-8"), before)
+
+    def test_touch_output_survives_a_missing_file(self):
+        pgs.touch_output(self.config())                 # no file yet: logs a warning, must not raise
 
 
 if __name__ == "__main__":

@@ -20,10 +20,10 @@ API_KEY = "test-key"
 ORG = "demo-org"
 
 
-def resource(rid, name, domain, health="healthy", enabled=True, hc=True, hc_in_list=True):
+def resource(rid, name, domain, health="healthy", enabled=True, hc=True, hc_in_list=True, labels=None):
     target = {"targetId": rid * 10, "ip": "10.0.0.%d" % (rid % 250), "port": 80, "siteId": 1, "hcEnabled": hc}
     listed = dict(target) if hc_in_list else {k: v for k, v in target.items() if k != "hcEnabled"}
-    return {
+    data = {
         "resourceId": rid,
         "name": name,
         "fullDomain": domain,
@@ -32,12 +32,15 @@ def resource(rid, name, domain, health="healthy", enabled=True, hc=True, hc_in_l
         "targets": [listed],
         "_targets": [target],
     }
+    if labels is not None:  # newer Pangolin versions report labels, older ones omit the field
+        data["labels"] = [{"labelId": 100 + i, "name": label, "color": "#16a34a"} for i, label in enumerate(labels)]
+    return data
 
 
 DEMO = [
-    resource(1, "Nextcloud", "cloud.example.com"),
-    resource(2, "Grafana", "grafana.example.com", health="unhealthy"),
-    resource(3, "Starting up", "boot.example.com", health="unknown"),
+    resource(1, "Nextcloud", "cloud.example.com", labels=["env:prod"]),
+    resource(2, "Grafana", "grafana.example.com", health="unhealthy", labels=["env:prod", "team:infra"]),
+    resource(3, "Starting up", "boot.example.com", health="unknown", labels=["env:staging"]),
     resource(4, "No health check", "api.prj.example.com", health="unknown", hc=False),
     resource(5, "Disabled", "off.example.com", enabled=False),
     resource(6, "Cost $avings", "money.example.com", health="unknown", hc_in_list=False),
@@ -45,8 +48,9 @@ DEMO = [
 
 
 class MockPangolin:
-    def __init__(self, resources, page_cap=None, legacy_only=False, api_key=API_KEY):
+    def __init__(self, resources, page_cap=None, legacy_only=False, api_key=API_KEY, no_labels=False):
         self.resources = resources
+        self.no_labels = no_labels
         self.page_cap = page_cap
         self.legacy_only = legacy_only
         self.api_key = api_key
@@ -63,9 +67,9 @@ class MockPangolin:
         self.server.shutdown()
         self.server.server_close()
 
-    @staticmethod
-    def public(r):
-        return {k: v for k, v in r.items() if not k.startswith("_")}
+    def public(self, r):
+        hidden = ("labels",) if self.no_labels else ()
+        return {k: v for k, v in r.items() if not k.startswith("_") and k not in hidden}
 
     def handle(self, method, raw_path, headers):
         url = urlparse(raw_path)

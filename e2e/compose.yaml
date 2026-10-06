@@ -17,6 +17,7 @@ services:
       PANGOLIN_ORG_ID: demo-org
       PANGOLIN_API_KEY: test-key
       GATUS_ALERT_TYPES: custom
+      GATUS_LABEL_GROUPS: "team:*=Squadre,env:prod=Produzione,env:staging=Staging"
       CHECK_INTERVAL: 10s
       SYNC_INTERVAL: "10"
       RESOURCE_EXCLUDE: ${E2E_EXCLUDE:-}
